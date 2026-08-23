@@ -1,0 +1,17 @@
+# 运行时数据（含监控原始事件与取证包，体积大且涉及本机隐私，不入库）
+events/
+output/
+*.ndjson
+*.lock
+STOP
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# 本机路径类敏感配置（按需本地创建）
+.env
