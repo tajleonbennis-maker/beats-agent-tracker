@@ -16,6 +16,7 @@
 #   SEED_PATTERN    种子进程 argv 前缀（逗号分隔多个）
 #   EXTRA_FS_PATHS  额外文件监视目录
 #   AUDIT_PROFILE   一等公民日志 profile（空 = 该 Agent 无第一方日志）
+#   SESSION_PROFILE 本地会话日志适配器（codex 或空）
 # 停止： bash agents/monitor_agent.sh --stop
 set -e
 
@@ -53,6 +54,7 @@ if [ "${1:-}" = "--stop" ]; then
   pkill -f "kiro/observer.py" 2>/dev/null || true
   pkill -f "kiro/watchdog.sh" 2>/dev/null || true
   pkill -f "agents/audit_tailer.py" 2>/dev/null || true
+  pkill -f "agents/codex_session_tailer.py" 2>/dev/null || true
   pkill -f "mitm_addon.py" 2>/dev/null || true
   pkill -f "mitmdump" 2>/dev/null || true
   echo "[stack] 已停止"
@@ -70,6 +72,7 @@ source "$PROFILE_FILE"
 AGENT_NAME="${AGENT_NAME:-$PROFILE}"
 SEED_PATTERN="${SEED_PATTERN:-}"
 AUDIT_PROFILE="${AUDIT_PROFILE:-}"
+SESSION_PROFILE="${SESSION_PROFILE:-}"
 
 ENABLE_MITM=0
 CAPTURE_READS_ARG=""
@@ -94,7 +97,7 @@ if [ -f "$PIDFILE" ]; then
   rm -f "$PIDFILE"
 fi
 
-export COLLECTOR_URL TRACE_ID
+export COLLECTOR_URL TRACE_ID AGENT_NAME
 
 # ---------------- 1. collector
 COLLECTOR_LOG="${ROOT}/events/collector.log"
@@ -116,7 +119,8 @@ for _d in "$HOME/Documents" "$HOME/Desktop" "$HOME/Downloads" \
           "$HOME/.ssh" "$HOME/.aws" "$HOME/.gnupg" "$HOME/.config"; do
   [ -d "$_d" ] && FS_PATHS+=("$_d")
 done
-"$PY" "${ROOT}/dashboard/fs_watcher.py" "${FS_PATHS[@]}" >"$FS_LOG" 2>&1 &
+TRACE_ID=filesystem_live AGENT_NAME=System "$PY" "${ROOT}/dashboard/fs_watcher.py" \
+  "${FS_PATHS[@]}" >"$FS_LOG" 2>&1 &
 FS_PID=$!
 echo "fs_watcher $FS_PID" >> "$PIDFILE"
 
@@ -155,14 +159,24 @@ if [ -n "$AUDIT_PROFILE" ]; then
   echo "audit_tailer $AUDIT_PID" >> "$PIDFILE"
 fi
 
+# ---------------- 4b. 本地会话日志（Codex VS Code 等）
+SESSION_PID=""
+if [ "$SESSION_PROFILE" = "codex" ]; then
+  SESSION_LOG="${ROOT}/events/codex_session_tailer.log"
+  "$PY" "${ROOT}/agents/codex_session_tailer.py" --collector "$COLLECTOR_URL" \
+    --backfill-latest >"$SESSION_LOG" 2>&1 &
+  SESSION_PID=$!
+  echo "session_tailer $SESSION_PID" >> "$PIDFILE"
+fi
+
 # ---------------- 5. 被动 observer（带 watchdog）
 OBSERVER_LOG="${ROOT}/events/observer.log"
-COLLECTOR_ARG="--collector $COLLECTOR_URL"
-SEED_ARG=""
-[ -n "$SEED_PATTERN" ] && SEED_ARG="--seed-pattern $SEED_PATTERN"
+OBSERVER_ARGS=(--agent-name "$AGENT_NAME" --collector "$COLLECTOR_URL")
+[ -n "$CAPTURE_READS_ARG" ] && OBSERVER_ARGS+=(--capture-reads)
+[ -n "$SEED_PATTERN" ] && OBSERVER_ARGS+=(--seed-pattern "$SEED_PATTERN")
 
 bash "${ROOT}/kiro/watchdog.sh" "$WS" "$TRACE_ID" \
-  --agent-name "$AGENT_NAME" $COLLECTOR_ARG $CAPTURE_READS_ARG $SEED_ARG \
+  "${OBSERVER_ARGS[@]}" \
   >"$OBSERVER_LOG" 2>&1 &
 WATCHDOG_PID=$!
 echo "watchdog $WATCHDOG_PID" >> "$PIDFILE"
@@ -178,6 +192,7 @@ echo " workspace : $WS"
 echo " trace_id  : $TRACE_ID"
 [ -n "$SEED_PATTERN" ] && echo " 种子进程  : $SEED_PATTERN"
 [ -n "$AUDIT_PID" ] && echo " audit日志 : 已接入 ($AUDIT_PROFILE, pid $AUDIT_PID)"
+[ -n "$SESSION_PID" ] && echo " 会话日志  : 已接入 ($SESSION_PROFILE, pid $SESSION_PID)"
 [ "$ENABLE_MITM" = "1" ] && echo " MITM      : 127.0.0.1:8080（已启用）"
 echo " 停止      : bash agents/monitor_agent.sh --stop"
 echo "=============================================="
