@@ -64,13 +64,15 @@ if [ "${1:-}" = "--stop" ]; then
     done < "$PIDFILE"
     rm -f "$PIDFILE"
   fi
-  # 兜底：杀所有相关子进程
-  pkill -f "dashboard/collector.py" 2>/dev/null || true
-  pkill -f "dashboard/fs_watcher.py" 2>/dev/null || true
-  pkill -f "kiro/observer.py" 2>/dev/null || true
-  pkill -f "kiro/watchdog.sh" 2>/dev/null || true
-  pkill -f "mitm_addon.py" 2>/dev/null || true
-  pkill -f "mitmdump" 2>/dev/null || true
+  # 兜底：杀所有相关子进程。
+  # 注意：模式必须锚定到实际启动命令（脚本路径+首参数），否则会误杀任何
+  # 命令行里恰好提到这些文件名的进程（如 grep/编辑器/AI 会话的 shell）。
+  pkill -f "collector\.py --port" 2>/dev/null || true
+  pkill -f "fs_watcher\.py --" 2>/dev/null || true
+  pkill -f "observer\.py --agent-name" 2>/dev/null || true
+  pkill -f "watchdog\.sh .*--agent-name" 2>/dev/null || true
+  pkill -f "mitmdump .*mitm_addon" 2>/dev/null || true
+  pkill -f "mitmdump --mode" 2>/dev/null || true
   echo "[stack] 已停止"
   exit 0
 fi
