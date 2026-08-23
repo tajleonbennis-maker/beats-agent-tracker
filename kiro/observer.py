@@ -50,7 +50,8 @@ import rules as rules_mod  # noqa: E402  R1/R2/R3 复用同一套规则语义
 
 KIRO_APP_PREFIX = "/Applications/Kiro.app"
 DEFAULT_EXCLUDE = {"node_modules", ".venv", "__pycache__", ".next", "dist",
-                   "build", ".turbo", ".DS_Store", "target", "vendor"}
+                   "build", ".turbo", ".DS_Store", "target", "vendor",
+                   "events", "output"}
 GRACEFUL_EXIT_CODE = 42          # watchdog 约定：42 = 优雅停止，不重启
 
 # ------------------------------------------------ 文件内容密钥嗅探（实时 R1）
@@ -413,7 +414,8 @@ class KiroObserver:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=2)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            opener.open(req, timeout=2)
         except Exception as e:
             # 网络抖动不致命，静默降级
             pass
@@ -461,13 +463,25 @@ class KiroObserver:
         return None
 
     def _seed_pids(self, procs):
-        seeds = [p for p, d in procs.items()
-                 if any(((d.get("argv") or "").startswith(pfx) or
-                         (d.get("exe") or "").startswith(pfx))
-                        for pfx in self.seed_patterns)]
+        seeds = []
+        for pid, detail in procs.items():
+            argv = detail.get("argv") or ""
+            exe = detail.get("exe") or ""
+            if pid == os.getpid() or self._is_monitor_process(argv):
+                continue
+            if any(pfx in argv or pfx in exe for pfx in self.seed_patterns):
+                seeds.append(pid)
         if self.seed_pid and self.seed_pid in procs:
             seeds.append(self.seed_pid)
         return set(seeds)
+
+    @staticmethod
+    def _is_monitor_process(argv):
+        return any(marker in (argv or "") for marker in (
+            "kiro/observer.py", "kiro/watchdog.sh", "dashboard/collector.py",
+            "dashboard/fs_watcher.py", "dashboard/mitm_addon.py",
+            "agents/audit_tailer.py", "agents/codex_session_tailer.py",
+            "agents/monitor_agent.sh", "agents/monitor_three_agents.sh"))
 
     # ---- 三层采集 ----
     def _emit_spawn(self, pid, argv, exe, parent_pid, ts, mode):
@@ -552,6 +566,9 @@ class KiroObserver:
             cur = queue.pop()
             for c in children.get(cur, []):
                 if c not in tree:
+                    cached = self._full_procs.get(c) or {}
+                    if self._is_monitor_process(cached.get("argv") or cached.get("exe") or ""):
+                        continue  # 连同监控器子树一起剪掉，避免观察器监控自身
                     tree.add(c)
                     queue.append(c)
         # 工作区前缀孤儿兜底（低频全量扫描的 argv/exe）
@@ -559,7 +576,7 @@ class KiroObserver:
             if pid in tree or pid not in ppids:
                 continue
             a = (d.get("argv") or "") or (d.get("exe") or "")
-            if a.startswith(self.workspace + "/"):
+            if a.startswith(self.workspace + "/") and not self._is_monitor_process(a):
                 tree.add(pid)
         # 孤儿续跟踪：中间父进程退出后孙进程 reparent 到 launchd(1)，ppid 链
         # 断裂，但已见 pid 仍在跟踪范围内（agent 长命令不因父进程退出而丢拍）
@@ -587,9 +604,10 @@ class KiroObserver:
             argv = _proc_argv(libc, pid) or procs[pid].get("argv") or ""
             self._pending[pid] = {"exe": exe, "argv": argv, "ts": now,
                                   "ppid": ppids.get(pid)}
-            # 30ms 后重取一次 exe/argv：跨过 fork→exec 窗口（~5-20ms），
-            # 短命进程（活不过一轮轮询）也能锁到 exec 后的真实命令行
-            threading.Timer(0.03, self._refetch_pending, args=(pid,)).start()
+            # Trae 的 sandbox 子进程可能只活几十毫秒。分别在 5ms/15ms 重取，
+            # 兼顾跨过 fork→exec 窗口与抢在短命命令退出前取得真实 argv。
+            threading.Timer(0.005, self._refetch_pending, args=(pid,)).start()
+            threading.Timer(0.015, self._refetch_pending, args=(pid,)).start()
         # ---- 首轮：当前树作为基线静默入账（吸收 pending）----
         if not self.seen_pids and tree:
             for pid in sorted(tree):
@@ -917,7 +935,8 @@ def main():
     # 两条相同的哈希链（所有事件双份、完整性校验失败）。PID 检测锁根治；
     # 撞锁时 exit 42，让守护它的 watchdog 也一并退出（旧实例继续服务）。
     os.makedirs(args.events_dir, exist_ok=True)
-    lock = os.path.join(args.events_dir, ".observer.lock")
+    lock_key = re.sub(r"[^a-zA-Z0-9_.-]+", "_", args.resume or args.agent_name)
+    lock = os.path.join(args.events_dir, f".observer.{lock_key}.lock")
     if os.path.exists(lock):
         try:
             old_pid = int(open(lock, encoding="utf-8").read().strip())
