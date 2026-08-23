@@ -19,6 +19,23 @@
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 兼容入口：旧脚本不再创建会与其他 Agent 冲突的 Kiro 单栈。
+# 所有启动/停止统一交给项目根目录 tracker.sh。
+if [ "${1:-}" = "--stop" ]; then
+  echo "[兼容] monitor_kiro.sh 已合并到统一 Agent Tracker。"
+  exec bash "${ROOT}/tracker.sh" stop
+fi
+if [ $# -gt 0 ]; then
+  _legacy_workspace="$1"
+  shift
+  # --mitm/--capture-reads 已是统一栈默认能力，无需继续透传。
+  echo "[兼容] 正在启动统一四-Agent采集栈（包含 Kiro）。"
+  exec bash "${ROOT}/tracker.sh" start "$_legacy_workspace"
+fi
+echo "用法: bash tracker.sh start [workspace]" >&2
+exit 2
+
 PY="${PYTHON:-/Users/jatsmith/.workbuddy/binaries/python/versions/3.13.12/bin/python3}"
 PIDFILE="${ROOT}/events/.kiro_stack.pids"
 COLLECTOR_URL="http://127.0.0.1:8787/ingest"
