@@ -1,0 +1,64 @@
+# Filebeat — Elasticsearch 完整栈配置（docker-compose 使用）
+# 采集 events/*.ndjson → 脱敏已由 Runtime 完成 → ECS 映射 → ES agent-trace-* 索引
+
+filebeat.inputs:
+  - type: filestream
+    id: agent-trace-events-es
+    enabled: true
+    paths:
+      - /events/*.ndjson
+    parsers:
+      - ndjson:
+          add_error_key: true
+          overwrite_keys: true
+    fields_under_root: true
+    fields:
+      event.dataset: agent.trace
+      event.module: beats-agent-tracker
+
+processors:
+  - timestamp:
+      field: timestamp
+      layouts: [RFC3339]
+      ignore_missing: true
+      ignore_failure: true
+  - copy_fields:
+      fields:
+        - from: trace_id
+          to: trace.id
+        - from: span_id
+          to: span.id
+        - from: parent_span_id
+          to: parent.id
+        - from: event_type
+          to: event.action
+        - from: source
+          to: event.provider
+      fail_on_error: false
+      ignore_missing: true
+  - fingerprint:
+      fields: ["trace_id", "span_id", "event_type", "timestamp"]
+      target: "event.hash"
+      ignore_missing: true
+  - add_host_metadata: ~
+
+output.elasticsearch:
+  hosts: ["${ES_HOST:http://elasticsearch:9200}"]
+  username: "${ES_USER:elastic}"
+  password: "${ES_PASSWORD:changeme}"
+  index: "agent-trace-%{[agent.version]}"
+  pipeline: "agent-trace-pipeline"
+
+setup.template:
+  name: "agent-trace"
+  pattern: "agent-trace-*"
+  enabled: true
+
+setup.ilm:
+  enabled: false
+
+logging:
+  to_stderr: true
+  level: info
+
+strict.perms: false
