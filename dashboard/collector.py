@@ -13,11 +13,14 @@ Agent 执行监视器 —— 实时事件收集器 + SSE 广播 + 本地仪表�
   python3 dashboard/collector.py [--port 8787] [--events-dir events]
 """
 import argparse
+import collections
+import html
 import json
 import os
 import queue
 import re
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +41,49 @@ STATE = {
     "last": None,           # 最新事件时间
 }
 LOCK = threading.Lock()
+CONTROL_TOKEN = secrets.token_urlsafe(24)
+REGISTRY_PATH = ROOT / "agents" / "registry.json"
+
+
+def _agent_registry():
+    try:
+        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data.get("agents"), list):
+            raise ValueError("agents must be a list")
+        return data
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"proxy_url": "http://127.0.0.1:8080", "agents": [], "error": str(exc)}
+
+
+def _port_listening(port: int) -> bool:
+    try:
+        return subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _agent_status(agent: dict, proxy_url: str) -> dict:
+    pairs = list(zip(agent.get("app_names", []), agent.get("app_paths", [])))
+    app_name = next((name for name, path in pairs if Path(path).is_dir()), None)
+    running = proxy_active = False
+    for pattern in agent.get("process_patterns", []):
+        try:
+            found = subprocess.run(["pgrep", "-f", pattern], capture_output=True,
+                                   text=True, timeout=3)
+            if found.returncode == 0:
+                running = True
+                for pid in found.stdout.split():
+                    cmd = subprocess.run(["ps", "-p", pid, "-o", "args="],
+                                         capture_output=True, text=True, timeout=3).stdout
+                    proxy_active |= f"--proxy-server={proxy_url}" in cmd
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return {"id": agent["id"], "name": agent["name"], "installed": app_name is not None,
+            "app_name": app_name, "running": running, "proxy_active": proxy_active,
+            "trace_ids": agent.get("trace_ids", [])}
 
 SECRET_CONTENT_PATTERNS = [
     ("password-assign", re.compile(r"(?i)(password|passwd|pwd|secret|token)\s*[:=]\s*['\"]?[\w\-./!@#$%^&*]{8,}")),
@@ -172,6 +218,10 @@ def _slim_event(ev: dict) -> dict:
             "summary": _slim_str(ev.get("action", {}).get("summary", "") or "", 300),
         },
     }
+    if et in ("conversation.user", "conversation.assistant"):
+        preview = slim["action"]["arguments_redacted"].get("preview")
+        if isinstance(preview, str):
+            slim["action"]["arguments_redacted"]["preview"] = html.unescape(preview)
     if et in ("llm.request", "llm.response"):
         full = json.dumps(ar, ensure_ascii=False)
         slim["_size"] = len(full)
@@ -487,7 +537,6 @@ def create_app(events_dir: str, fallback_trace_id: str):
                         obj = q.get(timeout=30)
                     except queue.Empty:
                         obj = {"kind": "ping"}
-                    obj = q.get(timeout=30)
                     yield f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
             finally:
                 with LOCK:
@@ -512,11 +561,27 @@ def create_app(events_dir: str, fallback_trace_id: str):
     def api_events():
         limit = min(int(request.args.get("limit", 100)), 20000)
         trace_id = request.args.get("trace_id")
-        with LOCK:
-            source = STATE["events"]
-            if trace_id:
-                source = [ev for ev in source if ev.get("trace_id") == trace_id]
-            events = source[-limit:]
+        events = None
+        if trace_id and re.fullmatch(r"[A-Za-z0-9_.-]+", trace_id):
+            trace_file = Path(config["events_dir"]) / f"{trace_id}.ndjson"
+            if trace_file.is_file():
+                tail = collections.deque(maxlen=limit)
+                try:
+                    with trace_file.open(encoding="utf-8", errors="ignore") as fh:
+                        for line in fh:
+                            try:
+                                tail.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                continue
+                    events = list(tail)
+                except OSError:
+                    events = None
+        if events is None:
+            with LOCK:
+                source = STATE["events"]
+                if trace_id:
+                    source = [ev for ev in source if ev.get("trace_id") == trace_id]
+                events = source[-limit:]
         if request.args.get("slim"):
             return jsonify([_slim_event(ev) for ev in events])
         return jsonify(events)
@@ -549,7 +614,11 @@ def create_app(events_dir: str, fallback_trace_id: str):
                 item["events"] += 1
                 item["last"] = ev.get("timestamp") or item["last"]
                 actor = ev.get("actor") or {}
-                item["agent"] = item["agent"] or actor.get("agent") or actor.get("name")
+                observed_agent = actor.get("agent") or actor.get("name")
+                if ev.get("event_type") in ("trace.begin", "trace.resume") and observed_agent:
+                    item["agent"] = observed_agent
+                else:
+                    item["agent"] = item["agent"] or observed_agent
                 if ev.get("event_type") in ("trace.begin", "trace.resume", "session.heartbeat"):
                     item["active"] = True
                 elif ev.get("event_type") == "trace.end":
@@ -559,13 +628,49 @@ def create_app(events_dir: str, fallback_trace_id: str):
             result = sorted(summaries.values(), key=lambda x: x.get("last") or "", reverse=True)
         return jsonify(result)
 
+    @app.route("/api/agents")
+    def api_agents():
+        registry = _agent_registry()
+        proxy_url = registry.get("proxy_url", "http://127.0.0.1:8080")
+        return jsonify({"proxy_url": proxy_url, "collector_up": _port_listening(8787),
+                        "proxy_up": _port_listening(8080), "upstream_up": _port_listening(1087),
+                        "agents": [_agent_status(a, proxy_url) for a in registry.get("agents", [])],
+                        "registry_error": registry.get("error")})
+
+    @app.route("/api/agents/<agent_id>/launch", methods=["POST"])
+    def api_agent_launch(agent_id):
+        if request.headers.get("X-Boss-Control") != CONTROL_TOKEN:
+            return jsonify({"ok": False, "error": "control token invalid"}), 403
+        registry = _agent_registry()
+        agent = next((a for a in registry.get("agents", []) if a.get("id") == agent_id), None)
+        if not agent:
+            return jsonify({"ok": False, "error": "unknown agent"}), 404
+        proxy_url = registry.get("proxy_url", "http://127.0.0.1:8080")
+        status = _agent_status(agent, proxy_url)
+        if not status["installed"]:
+            return jsonify({"ok": False, "error": "application not installed"}), 404
+        if not _port_listening(8080):
+            return jsonify({"ok": False, "error": "mitmproxy 127.0.0.1:8080 is not running"}), 409
+        if status["running"]:
+            message = "已通过专属代理运行" if status["proxy_active"] else "应用正在运行；请保存并完全退出后再启动"
+            return jsonify({"ok": status["proxy_active"], "error": message}), 200 if status["proxy_active"] else 409
+        try:
+            result = subprocess.run(["open", "-a", status["app_name"], "--args",
+                                     f"--proxy-server={proxy_url}"],
+                                    capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        if result.returncode:
+            return jsonify({"ok": False, "error": result.stderr.strip() or "launch failed"}), 500
+        return jsonify({"ok": True, "message": f'{status["name"]} 已通过 {proxy_url} 启动'})
+
     @app.route("/")
     def index():
         return render_template_string(DASHBOARD_HTML)
 
     @app.route("/boss")
     def boss():
-        return render_template_string(BOSS_HTML)
+        return render_template_string(BOSS_HTML, control_token=CONTROL_TOKEN)
 
     return app
 
@@ -704,18 +809,22 @@ BOSS_HTML = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent 查案视图 — BOSS</title>
 <style>
-  :root { --bg:#f2f4f7; --panel:#fff; --text:#1a1f26; --muted:#6b7280; --accent:#2563eb; --red:#dc2626; --orange:#d97706; --green:#16a34a; --purple:#7c3aed; --border:#e5e7eb; }
+  :root { --bg:#f3f6fa; --panel:#fff; --text:#172033; --muted:#667085; --accent:#3157d5; --red:#d92d20; --orange:#dc6803; --green:#079455; --purple:#6941c6; --border:#e4e7ec; --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.04); }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); }
-  header { background:var(--panel); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:10; flex-wrap:wrap; }
+  header { background:rgba(255,255,255,.94); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:14px; position:sticky; top:0; z-index:10; flex-wrap:wrap; }
   h1 { margin:0; font-size:18px; font-weight:650; }
   .meta { font-size:12px; color:var(--muted); }
   .nav { margin-left:auto; display:flex; gap:8px; font-size:13px; align-items:center; }
   .nav a { text-decoration:none; color:var(--muted); padding:5px 12px; border-radius:8px; }
   .nav a.active { background:#eef2ff; color:var(--accent); font-weight:600; }
   .nav label { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:4px; cursor:pointer; margin-left:10px; }
+  .trace-picker { min-width:280px; max-width:430px; border:1px solid var(--border); border-radius:9px; padding:7px 10px; background:#fff; color:var(--text); font-size:12px; outline:none; }
+  .trace-picker:focus { border-color:#84adff; box-shadow:0 0 0 3px #eff4ff; }
+  .live { display:inline-flex; align-items:center; gap:6px; color:var(--green); font-size:12px; font-weight:600; }
+  .live:before { content:''; width:7px; height:7px; border-radius:50%; background:currentColor; box-shadow:0 0 0 4px #ecfdf3; }
   .stats { display:grid; grid-template-columns:repeat(7,1fr); gap:12px; padding:14px 24px; }
-  .stat { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px; }
+  .stat { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px; box-shadow:var(--shadow); }
   .stat .label { font-size:12px; color:var(--muted); margin-bottom:5px; }
   .stat .value { font-size:24px; font-weight:700; }
   .stat.warn .value { color:var(--red); }
@@ -727,7 +836,7 @@ BOSS_HTML = r"""
   .risk-item .rid { font-weight:700; }
   .risk-item .r1 { color:var(--red); }
   .risk-item .r3, .risk-item .r2 { color:var(--orange); }
-  .task { background:var(--panel); border:1px solid var(--border); border-radius:14px; margin-bottom:14px; overflow:hidden; }
+  .task { background:var(--panel); border:1px solid var(--border); border-radius:14px; margin-bottom:14px; overflow:hidden; box-shadow:var(--shadow); }
   .task-head { padding:12px 18px; border-bottom:1px solid var(--border); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; background:#fafbfc; }
   .task-head .time { font-size:12px; color:var(--muted); white-space:nowrap; font-family:ui-monospace,monospace; }
   .task-head .instruction { font-size:15px; font-weight:650; flex:1; min-width:200px; }
@@ -782,14 +891,25 @@ BOSS_HTML = r"""
   .tl-more-btn { display:block; width:100%; margin:8px 0 4px; padding:6px; font-size:12.5px; color:var(--muted); background:#f5f7fa; border:1px solid #e5e7eb; border-radius:6px; cursor:pointer; }
   .tl-more-btn:hover { background:#eef1f5; }
   .empty { text-align:center; color:var(--muted); padding:50px 0; font-size:14px; }
-  @media (max-width:1000px) { .stats { grid-template-columns:repeat(4,1fr); } }
+  .agent-control { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:14px 18px; margin-bottom:14px; box-shadow:var(--shadow); }
+  .agent-control h2 { margin:0 0 10px; font-size:14px; }
+  .agent-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:9px; }
+  .agent-card { border:1px solid var(--border); border-radius:10px; padding:10px; font-size:12px; }
+  .agent-card strong { display:block; font-size:13px; margin-bottom:7px; }
+  .agent-card button { margin-top:8px; width:100%; border:1px solid #c7d2fe; background:#eef2ff; color:var(--accent); border-radius:7px; padding:6px; cursor:pointer; }
+  .agent-card button:disabled { cursor:not-allowed; opacity:.5; }
+  .agent-ok { color:var(--green); } .agent-warn { color:var(--orange); }
+  @media (max-width:1000px) { .stats { grid-template-columns:repeat(4,1fr); } .agent-grid{grid-template-columns:repeat(2,1fr)} .trace-picker{min-width:200px;} }
+  @media (max-width:680px) { header{padding:10px 14px}.nav{margin-left:0;width:100%;overflow:auto}.stats{grid-template-columns:repeat(2,1fr);padding:12px 14px}main{padding:0 14px 28px}.trace-picker{width:100%;max-width:none}.task-head,.task-body{padding-left:12px;padding-right:12px}.tl-e .t{width:72px}.row{display:block}.row .tag{display:block;width:auto;margin-bottom:2px} }
 </style>
 </head>
 <body>
 <header>
   <h1>🔍 Agent 查案视图</h1>
+  <span class="live" id="liveState">实时</span>
   <span class="meta" id="meta"></span>
   <div class="nav">
+    <select id="tracePicker" class="trace-picker" aria-label="选择 Agent 会话"></select>
     <label><input type="checkbox" id="noiseToggle"> 显示系统噪音</label>
     <a href="/boss" class="active">查案视图</a>
     <a href="/">原始事件</a>
@@ -798,12 +918,36 @@ BOSS_HTML = r"""
 
 <div class="stats" id="stats"></div>
 <main>
+  <section class="agent-control">
+    <h2>Agent 专属代理控制 <span class="meta" id="proxySummary"></span></h2>
+    <div class="agent-grid" id="agentGrid"><span class="meta">加载中…</span></div>
+  </section>
   <div class="risk-section" id="riskSummary" style="display:none"></div>
   <div id="tasks"></div>
 </main>
 
 <script>
+const BOSS_CONTROL_TOKEN = {{ control_token|tojson }};
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function loadAgents(){
+  const s = await fetch('/api/agents').then(r=>r.json());
+  document.getElementById('proxySummary').textContent =
+    `· Collector ${s.collector_up?'在线':'离线'} · MITM ${s.proxy_up?'在线':'离线'} · 上游 ${s.upstream_up?'在线':'离线'} · ${s.proxy_url}`;
+  document.getElementById('agentGrid').innerHTML = s.agents.map(a=>{
+    const state = !a.installed ? '未安装' : !a.running ? '未运行' : a.proxy_active ? '专属代理运行中' : '运行中（未走专属代理）';
+    const cls = a.proxy_active ? 'agent-ok' : 'agent-warn';
+    const disabled = !a.installed || !s.proxy_up || a.proxy_active;
+    return `<div class="agent-card"><strong>${esc(a.name)}</strong><span class="${cls}">${esc(state)}</span>`+
+      `<button ${disabled?'disabled':''} onclick="launchAgent('${esc(a.id)}')">专属代理启动</button></div>`;
+  }).join('');
+}
+async function launchAgent(id){
+  const r = await fetch('/api/agents/'+encodeURIComponent(id)+'/launch', {method:'POST', headers:{'X-Boss-Control':BOSS_CONTROL_TOKEN}});
+  const body = await r.json();
+  if(!r.ok || !body.ok) alert(body.error || '启动失败'); else alert(body.message || '已启动');
+  loadAgents();
+}
 
 // —— 时区安全的时间解析：兼容 Z 结尾 / +0800 / +08:00 / 无后缀(按UTC, fs_watcher源) ——
 function normTs(ts){
@@ -974,11 +1118,13 @@ function buildEntry(e){
   if(t === 'tool.http'){
     return { cat:'net', icon:'📤', html:'<b>HTTP ' + esc(ar.method||'GET') + '</b> ' + esc(ar.host||'') + '<span class="dim">' + esc(String(ar.path||'').slice(0,80)) + '</span>' };
   }
-  if(t === 'process.spawn'){
+  if(t === 'process.spawn' || t === 'process.span'){
     const pid = e.actor?.pid ?? ar.pid ?? '?';
     const cmd = ar.argv || ar.exe || '';
     const ghost = String(ar.scan_mode||'').includes('ghost') || !cmd;
-    let h = '<b>子进程启动</b> pid=' + esc(pid);
+    const plugin = e.actor?.agent_plugin || ar.agent_plugin;
+    let h = '<b>' + (t === 'process.span' ? '进程基线' : '子进程启动') + '</b> pid=' + esc(pid);
+    if(plugin) h += ' <span class="chip model">' + esc(plugin) + '</span>';
     if(ar.ppid) h += ' <span class="dim">← ppid ' + esc(ar.ppid) + '</span>';
     if(ar.parent_argv) h += ' <span class="dim">父: ' + esc(String(ar.parent_argv).slice(0,90)) + '</span>';
     if(cmd) h += '<br><code>' + esc(String(cmd).slice(0,220)) + '</code>';
@@ -990,7 +1136,8 @@ function buildEntry(e){
     let h = '<span class="dim">进程退出 pid=' + esc(pid);
     if(ar.lifetime_sec != null) h += ' · 存活 ' + esc(ar.lifetime_sec) + 's';
     h += '</span>';
-    if(ar.argv) h += '<br><code class="dim">' + esc(String(ar.argv).slice(0,180)) + '</code>';
+    const exitArgv = ar.argv || rs.argv;
+    if(exitArgv) h += '<br><code class="dim">' + esc(String(exitArgv).slice(0,180)) + '</code>';
     return { cat:'proc', icon:'▫️', html:h };
   }
   if(t === 'trace.resume') return { cat:'other', icon:'⏯️', html:'<span class="dim">会话恢复</span>' };
@@ -1067,11 +1214,21 @@ function renderTasks(events, alerts){
     const pre = events.filter(e => (normTs(e.timestamp)||0) < firstT);
     if(pre.length) tasks.push({ pseudo:true, evs:pre, t0:normTs(pre[0].timestamp), t1:firstT });
   }
-  instructions.forEach((ins,i)=>{
-    const t0 = normTs(ins.timestamp)||0;
-    const t1 = (i+1 < instructions.length) ? (normTs(instructions[i+1].timestamp)||Infinity) : Infinity;
-    tasks.push({ ins:ins, evs:events.filter(e => { const t = normTs(e.timestamp)||0; return t >= t0 && t < t1; }), t0:t0, t1:t1 });
-  });
+  if(instructions.length){
+    let cursor = events.findIndex(e => (normTs(e.timestamp)||0) >= firstT);
+    instructions.forEach((ins,i)=>{
+      const t0 = normTs(ins.timestamp)||0;
+      const t1 = (i+1 < instructions.length) ? (normTs(instructions[i+1].timestamp)||Infinity) : Infinity;
+      const evs = [];
+      while(cursor < events.length){
+        const t = normTs(events[cursor].timestamp)||0;
+        if(t >= t1) break;
+        if(t >= t0) evs.push(events[cursor]);
+        cursor++;
+      }
+      tasks.push({ins, evs, t0, t1});
+    });
+  }
   TL_ITEMS = [];       // taskCard 内会重新填充
   SEARCH_SEEN = { q: new Set(), u: new Set() };  // 搜索足迹去重也随重渲染重置
   box.innerHTML = tasks.map(taskCard).join('');
@@ -1108,7 +1265,7 @@ function taskCard(task){
 
   // 汇总
   const models = new Set(); const tools = new Map(); const reads = new Set(); const sensReads = new Set();
-  const writes = new Set(); const exts = new Map(); let spawns = 0;
+  const writes = new Set(); const exts = new Map(); const plugins = new Set(); let spawns = 0;
   evs.forEach(e => {
     const ar = e.action?.arguments_redacted || {};
     if(e.event_type==='llm.request' && e._model) models.add(e._model);
@@ -1117,6 +1274,8 @@ function taskCard(task){
     else if(['fs.write','fs.create','fs.rename'].includes(e.event_type)){ if(!isNoiseFsPath(ar.path)) writes.add(ar.path); }
     else if(['net.connect','tool.http'].includes(e.event_type)){ const h = ar.host || (ar.peer||'').split(':')[0]; if(h && !h.startsWith('127.') && !h.includes('telemetry') && !h.includes('download.kiro')) exts.set(h,(exts.get(h)||0)+1); }
     else if(e.event_type==='process.spawn') spawns++;
+    const plugin = e.actor?.agent_plugin || ar.agent_plugin;
+    if(plugin && plugin !== 'VS Code Extension Host') plugins.add(plugin);
   });
 
   // 告警与配额
@@ -1148,6 +1307,7 @@ function taskCard(task){
   const headTime = fmtHMS(t0);
 
   let rows = '';
+  if(plugins.size) rows += '<div class="row"><span class="tag">Agent 插件</span><span class="content">' + [...plugins].map(p=>'<span class="chip model">⚡ ' + esc(p) + '</span>').join('') + '</span></div>';
   if(models.size) rows += '<div class="row"><span class="tag">大模型</span><span class="content">' + [...models].map(m=>'<span class="chip model">' + esc(m) + '</span>').join('') + '</span></div>';
   if(tools.size) rows += '<div class="row"><span class="tag">执行操作</span><span class="content">' + [...tools].map(([n,c])=>'<span class="chip tool">🔧 ' + esc(n) + (c>1?(' ×'+c):'') + '</span>').join('') + '</span></div>';
   if(searchQueries.size) rows += '<div class="row"><span class="tag">Web 搜索</span><span class="content">' + [...searchQueries].map(q=>'<span class="chip model">🔎 ' + esc(q) + '</span>').join('') + '</span></div>';
@@ -1220,20 +1380,104 @@ document.getElementById('noiseToggle').addEventListener('change', function(){
 // 避免每 10 秒重复解析 ~15MB JSON 造成 webview 内存压力（闪退根因之一）
 let ALERTS = [];
 let LAST_SIG = null;
+let ACTIVE_TRACE = localStorage.getItem('boss.trace') || '';
+let TRACE_READY = false;
+let TRACE_GROUPS = new Map();
+
+async function loadTraces(){
+  const traces = await fetch('/api/traces').then(r=>r.json());
+  const picker = document.getElementById('tracePicker');
+  const agentOf = t => {
+    const id = String(t.trace_id||'').toLowerCase();
+    const name = String(t.agent||'').toLowerCase();
+    if(id.includes('vscode_codex') || name === 'codex') return 'Codex · VS Code';
+    if(id.includes('workbuddy') || name === 'workbuddy') return 'WorkBuddy';
+    if(id.includes('trae') || name === 'trae') return 'Trae';
+    if(id.includes('kiro') || name === 'kiro') return 'Kiro';
+    return '其他 / 历史';
+  };
+  const groups = new Map();
+  traces.forEach(t => { const g=agentOf(t); if(!groups.has(g)) groups.set(g,[]); groups.get(g).push(t); });
+  TRACE_GROUPS = groups;
+  const order = ['Codex · VS Code','WorkBuddy','Trae','Kiro','其他 / 历史'];
+  const options = '<option value="">全部 Agent（可能混合会话）</option>' + order.filter(g=>groups.has(g)).map(g =>
+    '<optgroup label="' + esc(g) + '">' +
+    (g === '其他 / 历史' ? '' : '<option value="agent:' + esc(g) + '">● ' + esc(g) + ' · 全部事件</option>') +
+    groups.get(g).map(t => {
+      const label = t.trace_id.includes('_main') ? '主会话' : (t.trace_id.includes('_https') ? 'HTTPS 流' : '进程 / 审计');
+      return '<option value="' + esc(t.trace_id) + '">' + (t.active?'● ':'') + label + ' · ' + esc(t.trace_id.slice(-12)) + ' · ' + t.events + '事件</option>';
+    }).join('') + '</optgroup>'
+  ).join('');
+
+  // fetch 期间用户可能刚切换 Agent，因此必须在响应返回后读取当前选择。
+  // 周期刷新也可能短暂缺少某个采集流；这种情况不能把用户踢回最新的 Kiro 会话。
+  const selected = ACTIVE_TRACE;
+  if(picker.innerHTML !== options) picker.innerHTML = options;
+  if(selected.startsWith('agent:')) {
+    const agent = selected.slice(6);
+    if(!groups.has(agent)) {
+      picker.insertAdjacentHTML('beforeend', '<option value="' + esc(selected) + '">● ' + esc(agent) + ' · 等待事件</option>');
+    }
+    picker.value = selected;
+  }
+  else if(selected && traces.some(t=>t.trace_id===selected)) {
+    // 旧版记住的是单条采集流；升级后默认迁移到对应 Agent 的聚合视图。
+    const old = traces.find(t=>t.trace_id===selected);
+    const group = agentOf(old);
+    ACTIVE_TRACE = group === '其他 / 历史' ? selected : 'agent:' + group;
+    picker.value = ACTIVE_TRACE;
+    localStorage.setItem('boss.trace', ACTIVE_TRACE);
+  }
+  else if(selected) {
+    // 保留暂时未出现在服务端列表中的单会话选择，等待下次刷新恢复。
+    picker.insertAdjacentHTML('beforeend', '<option value="' + esc(selected) + '">当前会话 · 等待事件</option>');
+    picker.value = selected;
+  }
+  else if(!TRACE_READY && traces.length){
+    const group = agentOf(traces[0]);
+    ACTIVE_TRACE = group === '其他 / 历史' ? traces[0].trace_id : 'agent:' + group;
+    picker.value = ACTIVE_TRACE;
+    localStorage.setItem('boss.trace', ACTIVE_TRACE);
+  }
+  TRACE_READY = true;
+}
+
+document.getElementById('tracePicker').addEventListener('change', e => {
+  ACTIVE_TRACE = e.target.value;
+  localStorage.setItem('boss.trace', ACTIVE_TRACE);
+  LAST_SIG = null;
+  load();
+});
+
 async function load(){
+  if(!TRACE_READY) await loadTraces();
   let sig = null;
   try {
     const s = await fetch('/api/state').then(r=>r.json());
-    sig = JSON.stringify([s.total, s.alerts, s.counters]);
+    sig = JSON.stringify([s.total, s.alerts, ACTIVE_TRACE]);
   } catch(_) {}
   if(LAST_SIG !== null && sig === LAST_SIG) return;  // 无新数据，跳过重量级拉取与重渲染
   LAST_SIG = sig;
-  const [evRes, alRes] = await Promise.all([
-    fetch('/api/events?limit=20000&slim=1').then(r=>r.json()),
-    fetch('/api/alerts').then(r=>r.json())
+  const traceIds = ACTIVE_TRACE.startsWith('agent:')
+    ? (TRACE_GROUPS.get(ACTIVE_TRACE.slice(6)) || []).map(t=>t.trace_id)
+    : (ACTIVE_TRACE ? [ACTIVE_TRACE] : []);
+  if(ACTIVE_TRACE.startsWith('agent:') && !traceIds.length) {
+    // Agent 分组短暂消失时保留当前画面；空数组不能退化成“拉取全部 Agent”。
+    LAST_SIG = null;
+    return;
+  }
+  const eventUrls = traceIds.length
+    ? traceIds.map(id=>'/api/events?limit=20000&slim=1&trace_id='+encodeURIComponent(id))
+    : ['/api/events?limit=20000&slim=1'];
+  const alertUrls = traceIds.length
+    ? traceIds.map(id=>'/api/alerts?trace_id='+encodeURIComponent(id))
+    : ['/api/alerts'];
+  const [eventParts, alertParts] = await Promise.all([
+    Promise.all(eventUrls.map(url=>fetch(url).then(r=>r.json()))),
+    Promise.all(alertUrls.map(url=>fetch(url).then(r=>r.json())))
   ]);
-  ALERTS = Array.isArray(alRes) ? alRes : [];
-  let events = Array.isArray(evRes) ? evRes : [];
+  ALERTS = alertParts.flat().filter(Boolean);
+  let events = eventParts.flat().filter(Boolean);
   events = dedupeFs(events);
   events.sort((a,b) => (normTs(a.timestamp)||0) - (normTs(b.timestamp)||0));
   renderMeta(events, ALERTS);
@@ -1242,7 +1486,29 @@ async function load(){
   renderTasks(events, ALERTS);
 }
 load();
+loadAgents();
 setInterval(load, 10000);
+setInterval(loadTraces, 30000);
+setInterval(loadAgents, 5000);
+const liveEvents = new EventSource('/events');
+let liveTimer = null;
+liveEvents.onopen = () => { document.getElementById('liveState').textContent='实时'; };
+liveEvents.onerror = () => { document.getElementById('liveState').textContent='重连中'; };
+liveEvents.onmessage = ev => {
+  try {
+    const msg = JSON.parse(ev.data);
+    if(msg.kind === 'ping') return;
+    const tid = msg.data?.trace_id;
+    if(ACTIVE_TRACE && tid) {
+      if(ACTIVE_TRACE.startsWith('agent:')) {
+        const ids = (TRACE_GROUPS.get(ACTIVE_TRACE.slice(6)) || []).map(t=>t.trace_id);
+        if(!ids.includes(tid)) return;
+      } else if(tid !== ACTIVE_TRACE) return;
+    }
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(()=>{ LAST_SIG=null; load(); }, 700);
+  } catch(_) {}
+};
 </script>
 </body>
 </html>
