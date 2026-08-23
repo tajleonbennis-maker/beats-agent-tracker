@@ -11,31 +11,45 @@ MODE="${1:-status}"
 PORT=8080
 HOST=127.0.0.1
 
-# 获取当前活跃的网络接口（Wi-Fi 或 Ethernet）
-IFACE=$(networksetup -listallnetworkservices | grep -E "Wi-Fi|Ethernet|USB|Thunderbolt" | head -1 | sed 's/^\*//')
-if [ -z "$IFACE" ]; then
-  echo "[proxy] 找不到网络接口"
+# 获取所有启用的物理网络服务。不能取列表第一项：它可能不是默认路由所在接口。
+SERVICES=()
+while IFS= read -r service; do
+  case "$service" in
+    ""|"An asterisk"*) continue ;;
+    \**) continue ;;
+    *VPN*|*L2TP*) continue ;;
+  esac
+  SERVICES+=("$service")
+done < <(networksetup -listallnetworkservices)
+if [ ${#SERVICES[@]} -eq 0 ]; then
+  echo "[proxy] 找不到已启用的网络服务"
   exit 1
 fi
 
 case "$MODE" in
   on)
-    echo "[proxy] 在接口 '$IFACE' 上设置 HTTP/HTTPS 代理为 $HOST:$PORT"
-    networksetup -setwebproxy "$IFACE" "$HOST" "$PORT"
-    networksetup -setsecurewebproxy "$IFACE" "$HOST" "$PORT"
+    for service in "${SERVICES[@]}"; do
+      echo "[proxy] 在 '$service' 上设置 HTTP/HTTPS 代理为 $HOST:$PORT"
+      networksetup -setwebproxy "$service" "$HOST" "$PORT"
+      networksetup -setsecurewebproxy "$service" "$HOST" "$PORT"
+    done
     echo "[proxy] ✅ 已开启。Kiro 等应用的新连接将经过 mitmproxy。"
     echo "[proxy] 注意：bash kiro/monitor_kiro.sh ... --mitm 会自动启动 mitmproxy。"
     ;;
   off)
-    echo "[proxy] 关闭接口 '$IFACE' 的 HTTP/HTTPS 代理"
-    networksetup -setwebproxystate "$IFACE" off
-    networksetup -setsecurewebproxystate "$IFACE" off
+    for service in "${SERVICES[@]}"; do
+      echo "[proxy] 关闭 '$service' 的 HTTP/HTTPS 代理"
+      networksetup -setwebproxystate "$service" off
+      networksetup -setsecurewebproxystate "$service" off
+    done
     echo "[proxy] ✅ 已关闭"
     ;;
   status)
-    echo "[proxy] 接口: $IFACE"
-    networksetup -getwebproxy "$IFACE"
-    networksetup -getsecurewebproxy "$IFACE"
+    for service in "${SERVICES[@]}"; do
+      echo "[proxy] 网络服务: $service"
+      networksetup -getwebproxy "$service"
+      networksetup -getsecurewebproxy "$service"
+    done
     ;;
   *)
     echo "用法: $0 on|off|status"
