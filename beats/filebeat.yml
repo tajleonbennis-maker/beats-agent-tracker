@@ -1,0 +1,95 @@
+# Filebeat — Agent 执行跟踪器采集层（Beats 只做采集，不做关联）
+# 规范 07-Agent-Execution-Trace-Observability.md 第 5 节架构中
+# 把 OpenTelemetry Collector 的角色替换为 Beats。
+
+# 关键设计：哈希链在 Runtime 写入时已计算（evidence.hash）。
+# Beats 只允许"附加"字段（ECS 映射、fingerprint），不允许修改
+# schema 核心字段 —— 否则 evidence.py verify 会判定篡改。
+# 因此 redact processor 默认注释（纵深防御备选，开启即放弃链校验）。
+
+filebeat.inputs:
+  - type: filestream
+    id: agent-trace-events
+    enabled: true
+    paths:
+      - ${AGENT_TRACE_EVENTS_DIR:/Users/jatsmith/WorkBuddy/code/beats-agent-tracker/events}/*.ndjson
+    parsers:
+      - ndjson:
+          add_error_key: true
+          overwrite_keys: true
+    prospector.scanner.exclude_files: [".gz$"]
+    fields_under_root: true
+    fields:
+      event.dataset: agent.trace
+      event.module: beats-agent-tracker
+      service.name: agent-runtime
+
+queue.mem:
+  events: 4096
+  flush.min_events: 1
+  flush.timeout: 0s
+
+processors:
+  # 1) 时间戳：schema 的 timestamp 字段 → @timestamp（ECS）
+  - timestamp:
+      field: timestamp
+      layouts:
+        - RFC3339
+      ignore_missing: true
+      ignore_failure: true
+
+  # 2) ECS 映射：trace_id/span_id → trace.id / span.id / parent.id
+  #    event_type → event.action；source → event.provider
+  - copy_fields:
+      fields:
+        - from: trace_id
+          to: trace.id
+        - from: span_id
+          to: span.id
+        - from: parent_span_id
+          to: parent.id
+        - from: event_type
+          to: event.action
+        - from: source
+          to: event.provider
+      fail_on_error: false
+      ignore_missing: true
+
+  # 3) 事件指纹（去重 / 幂等入库，不改变哈希覆盖字段）
+  - fingerprint:
+      fields: ["trace_id", "span_id", "event_type", "timestamp"]
+      target: "event.hash"
+      ignore_missing: true
+
+  # 4) 主机元数据（系统事实链的采集端上下文）
+  - add_host_metadata: ~
+  - add_cloud_metadata: ~
+
+  # 5) （可选，默认关闭）纵深防御脱敏。
+  #    ⚠️ 开启会修改 action.* 内容 → 哈希链校验失败（会被判为篡改）。
+  #    Runtime 已在哈希前脱敏（arguments_redacted），仅在不启用链校验时使用。
+  # - redact:
+  #     fields:
+  #       - action.arguments_redacted.command
+  #       - action.result_summary.stdout
+  #       - action.result_summary.stderr
+  #     patterns:
+  #       - "(?i)(authorization|bearer)[=: ]+\\S+"
+  #       - "(?i)(api[_-]?key|secret|password|token)[=: ]+\\S+"
+  #       - "sk-[A-Za-z0-9_\\-]{8,}"
+  #       - "AKIA[0-9A-Z]{16}"
+  #       - "gh[pousr]_[A-Za-z0-9]{20,}"
+  #     replace_with: "[REDACTED]"
+
+# MVP 本地演示输出：console（重定向到 output/processed.ndjson）
+# 完整栈切到 docker-compose 中的 filebeat.es.yml
+output.console:
+  codec.json:
+    pretty: false
+
+logging:
+  to_stderr: true
+  level: info
+  selectors: ["filestream"]
+
+strict.perms: false
