@@ -1,0 +1,53 @@
+<svg viewBox="0 0 680 400" width="680" height="400" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Web 应用接入 Agent 执行链跟踪的三条采集路径</title>
+  <desc>服务器上的 Web 应用通过 eBPF、MITM 代理、SDK 声明式上报三条路径把事件送入汇集器，再经关联和规则引擎到面板</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <style>
+    .t{font:400 13px -apple-system,"PingFang SC",sans-serif;fill:#1a1a1a}
+    .th{font:500 13px -apple-system,"PingFang SC",sans-serif;fill:#1a1a1a}
+    .ts{font:400 12px -apple-system,"PingFang SC",sans-serif;fill:#666}
+  </style>
+  <rect x="0" y="0" width="680" height="400" fill="#ffffff"/>
+  <rect x="40" y="24" width="280" height="230" rx="16" fill="#EEEDFE" stroke="#AFA9EC" stroke-width="0.5"/>
+  <text class="th" x="180" y="48" text-anchor="middle">你的服务器（Linux）</text>
+  <text class="ts" x="180" y="66" text-anchor="middle">Web 应用 + 大模型</text>
+  <g>
+    <rect x="64" y="82" width="232" height="40" rx="8" fill="#CECBF6" stroke="#534AB7" stroke-width="0.5"/>
+    <text class="th" x="180" y="102" text-anchor="middle" dominant-baseline="central">Web 应用进程（gunicorn/node）</text>
+  </g>
+  <g>
+    <rect x="64" y="134" width="232" height="40" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+    <text class="th" x="180" y="152" text-anchor="middle" dominant-baseline="central">LLM API 调用（HTTPS）</text>
+    <text class="ts" x="180" y="168" text-anchor="middle" dominant-baseline="central">DeepSeek / OpenAI / 自建模型</text>
+  </g>
+  <g>
+    <rect x="64" y="186" width="232" height="40" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+    <text class="th" x="180" y="206" text-anchor="middle" dominant-baseline="central">工具执行 / 子进程 / 文件读写</text>
+  </g>
+  <path d="M296 102 L370 118" stroke="#534AB7" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M296 154 L370 154" stroke="#185FA5" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <path d="M296 206 L370 190" stroke="#0F6E56" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="376" y="96" width="264" height="110" rx="12" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+  <text class="th" x="508" y="118" text-anchor="middle">三条采集路径</text>
+  <text class="t" x="392" y="140">① eBPF：exec/connect tracepoint</text>
+  <text class="t" x="392" y="160">② MITM：解密 LLM API 明文请求</text>
+  <text class="t" x="392" y="180">③ SDK 上报：应用内埋点声明事件</text>
+  <path d="M508 206 L508 240" stroke="#5F5E5A" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="388" y="246" width="240" height="44" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+    <text class="th" x="508" y="262" text-anchor="middle" dominant-baseline="central">collect_server :18787</text>
+    <text class="ts" x="508" y="280" text-anchor="middle" dominant-baseline="central">统一 schema 0.1 + 哈希链</text>
+  </g>
+  <path d="M508 290 L508 320" stroke="#5F5E5A" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="388" y="326" width="240" height="44" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+    <text class="th" x="508" y="342" text-anchor="middle" dominant-baseline="central">correlator + R1/R2/R3 规则</text>
+    <text class="ts" x="508" y="360" text-anchor="middle" dominant-baseline="central">→ Boss 面板时间线 / 告警 / 证据包</text>
+  </g>
+  <path d="M180 226 C180 300 320 348 388 348" stroke="#888780" stroke-width="0.5" fill="none" stroke-dasharray="4 3"/>
+  <text class="ts" x="230" y="300">系统事实（黑盒，不依赖应用配合）</text>
+</svg>
