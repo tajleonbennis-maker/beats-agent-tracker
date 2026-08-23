@@ -117,6 +117,7 @@ AUDIT_PROFILE="workbuddy"                     # 一等公民日志源（无则�
 
 ```bash
 bash agents/monitor_agent.sh workbuddy /path/to/ws --capture-reads   # 启动
+bash agents/monitor_agent.sh vscode /path/to/ws --capture-reads     # VS Code 多插件通用追踪
 bash agents/monitor_agent.sh --stop                                  # 停止
 ```
 
@@ -129,6 +130,44 @@ bash agents/monitor_agent.sh --stop                                  # 停止
 2. **被动观测（kiro/observer.py，已通用化）**：`--agent-name` 决定 trace 前缀与
    source；`--seed-pattern` 支持逗号分隔多个前缀；`--seed-pid` 盯任意进程树。
    看 Agent 没承认的系统事实（文件/进程/外联）。
+
+### VS Code Agent 插件追踪
+
+`vscode` profile 监视整个 VS Code/Insiders/Cursor/CodeBuddy 进程树，并从
+Extension Host、扩展 CLI 与子进程 argv 中识别 WorkBuddy、Continue、Codex、
+GitHub Copilot、Cline。识别结果写入 `actor.agent_plugin`，Boss 页面按会话展示
+插件、进程父子关系、文件操作与外联。WorkBuddy 的第一方 audit-log 会同时接入；
+其他插件即使没有公开审计日志，也能使用系统事实链完成追踪。
+
+```bash
+bash agents/monitor_agent.sh vscode /path/to/vscode-workspace --capture-reads
+# 打开 http://127.0.0.1:8787/boss，在顶部选择对应 trace 会话
+```
+
+### 统一启动（推荐）
+
+不要分别启动 Kiro、Trae 或 WorkBuddy 的采集栈。项目统一管理 Boss、MITM 和四个
+Agent 观察器：
+
+```bash
+bash tracker.sh start /path/to/主要工作区
+bash tracker.sh status
+bash tracker.sh restart
+bash tracker.sh stop
+```
+
+启动采集栈不会修改 macOS 系统代理。只采集 Trae HTTPS 流量时，先完全退出
+Trae，再用应用级代理启动：
+
+```bash
+bash agents/trae_proxy.sh start /path/to/主要工作区
+# Trae 已经运行时，脚本会提示保存并退出；退出后执行：
+bash agents/trae_proxy.sh launch
+```
+
+链路为 `Trae -> 127.0.0.1:8080 -> 127.0.0.1:1087`，不会影响其他应用。
+
+`kiro/monitor_kiro.sh` 仅作为旧命令兼容入口，执行时也会启动统一四-Agent栈。
 
 ## 实战：被动监视第三方 AI IDE（Kiro）
 
