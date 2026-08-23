@@ -233,7 +233,8 @@ class AuditTailer:
             self.collector_url, data=body, method="POST",
             headers={"Content-Type": "application/x-ndjson"})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=10) as r:
                 return r.status == 200
         except Exception as e:
             print(f"[tailer] collector 投递失败（{e}），{len(events)} 条进 backlog", file=sys.stderr)
