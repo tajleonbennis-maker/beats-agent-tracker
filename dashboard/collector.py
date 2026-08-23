@@ -446,8 +446,8 @@ def ingest_event(ev: dict, config: dict):
     # 内存状态 + 广播
     with LOCK:
         STATE["events"].append(ev)
-        if len(STATE["events"]) > 10000:
-            STATE["events"] = STATE["events"][-10000:]
+        if len(STATE["events"]) > GLOBAL_HISTORY_MAX:
+            STATE["events"] = _cap_events_per_trace(STATE["events"])
         STATE["counters"][et] = STATE["counters"].get(et, 0) + 1
         STATE["last"] = ev.get("timestamp")
 
@@ -462,6 +462,28 @@ def ingest_event(ev: dict, config: dict):
                 STATE["alerts"] = STATE["alerts"][-1000:]
         _append_to_file(Path(config["events_dir"]) / f"{trace_id}_alerts.ndjson", [alert])
         _broadcast({"kind": "alert", "data": alert})
+
+
+PER_TRACE_HISTORY = 2000   # 单个 trace 内存保留条数
+GLOBAL_HISTORY_MAX = 30000  # 全局裁剪触发阈值
+
+
+def _cap_events_per_trace(evs: list) -> list:
+    """按 trace 分桶裁剪：每个 trace 保留最近 PER_TRACE_HISTORY 条。
+
+    背景：全局只留最近 N 条时，高频 process/net trace（每小时数千条）会把
+    低频的会话/上下文 trace（conversation.*，通常只有几十条）整体挤出内存，
+    导致 Boss 面板重启后"上下文消失、只剩告警"。分桶后每个 trace 都有自己的
+    保留份额，低频 trace 不再被饿死。
+    """
+    per = collections.defaultdict(list)
+    for ev in evs:
+        per[ev.get("trace_id") or "unknown"].append(ev)
+    out = []
+    for lst in per.values():
+        out.extend(lst[-PER_TRACE_HISTORY:])
+    out.sort(key=lambda e: e.get("timestamp", "") or "")
+    return out
 
 
 def _load_history(events_dir: str):
@@ -488,7 +510,7 @@ def _load_history(events_dir: str):
             continue
     if loaded:
         loaded.sort(key=lambda e: e.get("timestamp", "") or "")
-        loaded = loaded[-10000:]
+        loaded = _cap_events_per_trace(loaded)
         with LOCK:
             STATE["events"] = loaded
             for ev in loaded:
