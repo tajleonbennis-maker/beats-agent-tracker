@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "proxy_url": "http://127.0.0.1:8080",
+  "agents": [
+    {"id":"trae","name":"Trae","app_names":["TRAE SOLO CN","Trae"],"app_paths":["/Applications/TRAE SOLO CN.app","/Applications/Trae.app"],"process_patterns":["/Applications/TRAE SOLO CN.app/Contents","/Applications/Trae.app/Contents"],"trace_ids":["trae_process_live","trae_https"]},
+    {"id":"kiro","name":"Kiro","app_names":["Kiro"],"app_paths":["/Applications/Kiro.app"],"process_patterns":["/Applications/Kiro.app/Contents"],"trace_ids":["kiro_process_live","kiro_https"]},
+    {"id":"workbuddy","name":"WorkBuddy","app_names":["WorkBuddy"],"app_paths":["/Applications/WorkBuddy.app"],"process_patterns":["/Applications/WorkBuddy.app/Contents"],"trace_ids":["workbuddy_process_live","workbuddy_https"]},
+    {"id":"vscode_codex","name":"VS Code / Codex","app_names":["Visual Studio Code"],"app_paths":["/Applications/Visual Studio Code.app"],"process_patterns":["/Applications/Visual Studio Code.app/Contents"],"trace_ids":["vscode_codex_process_live","vscode_codex_https"]}
+  ]
+}
