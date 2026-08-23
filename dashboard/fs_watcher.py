@@ -24,6 +24,9 @@ import FSEvents
 
 COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "http://127.0.0.1:8787/ingest")
 TRACE_ID = os.environ.get("TRACE_ID", "kiro_live")
+AGENT_NAME = os.environ.get("AGENT_NAME", "System")
+ROOT = Path(__file__).resolve().parents[1]
+IGNORE_ROOTS = (str(ROOT / "events") + os.sep, str(ROOT / "output") + os.sep)
 
 
 FLAG_NAMES = {
@@ -56,7 +59,8 @@ def _post(event):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=2)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open(req, timeout=2)
     except Exception as e:
         print(f"[fs_watcher] post failed: {e}", file=sys.stderr)
 
@@ -70,7 +74,7 @@ def _make_event(event_type, path, flags_desc, pid=None):
         "timestamp": _now(),
         "event_type": event_type,
         "source": "fsevents",
-        "actor": {"type": "process", "pid": pid, "name": "Kiro"},
+        "actor": {"type": "process", "pid": pid, "name": AGENT_NAME},
         "action": {
             "name": event_type,
             "arguments_redacted": {"path": path, "workspace": os.path.dirname(path), "flags": flags_desc},
@@ -103,6 +107,8 @@ def _decode_flags(flags):
 
 def handler(streamRef, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds):
     for path, flag in zip(eventPaths, eventFlags):
+        if any(str(path).startswith(prefix) for prefix in IGNORE_ROOTS):
+            continue
         et = _event_type_from_flags(flag)
         flags_desc = _decode_flags(flag)
         ev = _make_event(et, path, flags_desc)
