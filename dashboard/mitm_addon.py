@@ -30,7 +30,43 @@ from mitmproxy import http, ctx
 
 COLLECTOR_URL = os.environ.get("COLLECTOR_URL", "http://127.0.0.1:8787/ingest")
 TRACE_ID = os.environ.get("TRACE_ID", "kiro_live")
+AGENT_NAME = os.environ.get("AGENT_NAME", "Kiro")
 SPAN_COUNTER = [0]
+SENSITIVE_HEADERS = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "api-key", "x-auth-token", "x-cloudide-token",
+}
+
+
+def _redact_headers(headers) -> dict:
+    """保留排障需要的头名称，同时避免凭据明文进入证据文件。"""
+    return {
+        str(k): "[REDACTED]" if str(k).lower() in SENSITIVE_HEADERS else str(v)
+        for k, v in headers.items()
+    }
+
+
+def _agent_for_host(host: str) -> str:
+    """按目标服务识别 Agent；未知流量保留启动 profile 身份。"""
+    value = (host or "").lower()
+    if any(x in value for x in ("openai.com", "chatgpt.com")):
+        return "Codex"
+    if any(x in value for x in ("workbuddy", "copilot.tencent", "tencent.com")):
+        return "WorkBuddy"
+    if any(x in value for x in ("trae", "mchost.guru", "zijieapi.com", "volcengine", "byteoversea")):
+        return "Trae"
+    if any(x in value for x in ("kiro.dev", "codewhisperer", "amazonaws.com")):
+        return "Kiro"
+    return AGENT_NAME
+
+
+def _trace_for_agent(name: str) -> str:
+    return {
+        "Codex": "vscode_codex_https",
+        "WorkBuddy": "workbuddy_https",
+        "Trae": "trae_https",
+        "Kiro": "kiro_https",
+    }.get(name, TRACE_ID)
 
 
 def _span_id():
@@ -48,16 +84,18 @@ def _post(event: dict):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=2)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open(req, timeout=2)
     except Exception as e:
         ctx.log.debug(f"[mitm_addon] post failed: {e}")
 
 
 def _make_event(event_type: str, span_id: str, parent_span_id: str,
                 actor: dict, action: dict, extra: dict = None) -> dict:
+    agent_name = actor.get("agent") or actor.get("name") or AGENT_NAME
     return {
         "schema_version": "0.1",
-        "trace_id": TRACE_ID,
+        "trace_id": _trace_for_agent(agent_name),
         "span_id": span_id,
         "parent_span_id": parent_span_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime()) + f"{time.time_ns()%1_000_000_000:09d}"[:3] + "Z",
@@ -199,6 +237,8 @@ class AgentTrafficAddon:
         span_id = _span_id()
         self.flow_spans[flow.id] = span_id
         host = _host_from_flow(flow)
+        agent_name = _agent_for_host(host)
+        flow.metadata["agent_name"] = agent_name
 
         # 1.  richer net.connect
         peer = f"{flow.server_conn.peername[0]}:{flow.server_conn.peername[1]}" if flow.server_conn.peername else None
@@ -206,7 +246,7 @@ class AgentTrafficAddon:
             "net.connect",
             span_id,
             None,
-            actor={"type": "process", "pid": None, "name": "Kiro", "path": "/Applications/Kiro.app"},
+            actor={"type": "process", "pid": None, "name": agent_name},
             action={
                 "name": "http_request",
                 "arguments_redacted": {
@@ -217,7 +257,7 @@ class AgentTrafficAddon:
                     "peer": peer,
                     "sni": getattr(flow.server_conn, "sni", None),
                     "ja3": getattr(flow.client_conn, "ja3", None),
-                    "headers": dict(flow.request.headers),
+                    "headers": _redact_headers(flow.request.headers),
                 },
                 "result_summary": {},
                 "summary": f"{flow.request.method} {host}{flow.request.path}",
@@ -243,7 +283,7 @@ class AgentTrafficAddon:
                 if _looks_like_llm(flow.request.pretty_url, req_json, {}):
                     llm_ev = _make_event(
                         "llm.request", f"{span_id}_llm", span_id,
-                        actor={"type": "agent", "name": "Kiro"},
+                        actor={"type": "agent", "name": agent_name},
                         action={"name": "chat_completion",
                                 "arguments_redacted": req_json,
                                 "result_summary": {},
@@ -252,26 +292,26 @@ class AgentTrafficAddon:
                 if kiro_msg:
                     conv_ev = _make_event(
                         "conversation.user", f"{span_id}_conv_user", f"{span_id}_llm",
-                        actor={"type": "user", "name": "operator"},
+                        actor={"type": "user", "name": "operator", "agent": agent_name},
                         action={"name": "user_message",
                                 "arguments_redacted": {"role": "user", "preview": kiro_msg[:200]},
                                 "result_summary": {},
-                                "summary": f"User → Kiro: {kiro_msg[:120]}"})
+                                "summary": f"User → {agent_name}: {kiro_msg[:120]}"})
                     _post(conv_ev)
                 for t in kiro_texts:
                     conv_ev = _make_event(
                         "conversation.assistant", f"{span_id}_conv_asst", span_id,
-                        actor={"type": "agent", "name": "Kiro"},
+                        actor={"type": "agent", "name": agent_name},
                         action={"name": "assistant_message",
                                 "arguments_redacted": {"role": "assistant", "preview": t[:200]},
                                 "result_summary": {},
-                                "summary": f"Kiro → User: {t[:120]}"})
+                                "summary": f"{agent_name} → User: {t[:120]}"})
                     _post(conv_ev)
                 for t in kiro_tools:
                     args = {"command": t["command"]} if t["command"] else t["arguments"]
                     tool_ev = _make_event(
                         "tool.invoke", f"{span_id}_tool_{t['tool_name']}", span_id,
-                        actor={"type": "agent", "name": "Kiro"},
+                        actor={"type": "agent", "name": agent_name},
                         action={"name": t["tool_name"],
                                 "arguments_redacted": args,
                                 "result_summary": {},
@@ -284,7 +324,7 @@ class AgentTrafficAddon:
                 if tool:
                     tool_ev = _make_event(
                         "tool.invoke", f"{span_id}_tool", span_id,
-                        actor={"type": "agent", "name": "Kiro"},
+                        actor={"type": "agent", "name": agent_name},
                         action={"name": tool["tool_name"],
                                 "arguments_redacted": tool["arguments"],
                                 "result_summary": {},
@@ -294,7 +334,7 @@ class AgentTrafficAddon:
                 if _looks_like_llm(flow.request.pretty_url, req_json, {}):
                     llm_ev = _make_event(
                         "llm.request", f"{span_id}_llm", span_id,
-                        actor={"type": "agent", "name": "Kiro"},
+                        actor={"type": "agent", "name": agent_name},
                         action={"name": "chat_completion",
                                 "arguments_redacted": req_json,
                                 "result_summary": {},
@@ -305,16 +345,17 @@ class AgentTrafficAddon:
                         if m["role"] in ("user", "human"):
                             conv_ev = _make_event(
                                 "conversation.user", f"{span_id}_conv_user", f"{span_id}_llm",
-                                actor={"type": "user", "name": "operator"},
+                                actor={"type": "user", "name": "operator", "agent": agent_name},
                                 action={"name": "user_message",
                                         "arguments_redacted": {"role": m["role"], "preview": m["content"][:200]},
                                         "result_summary": {},
-                                        "summary": f"User → Kiro: {m['content'][:120]}"})
+                                        "summary": f"User → {agent_name}: {m['content'][:120]}"})
                             _post(conv_ev)
 
     def response(self, flow: http.HTTPFlow):
         span_id = self.flow_spans.pop(flow.id, _span_id())
         host = _host_from_flow(flow)
+        agent_name = flow.metadata.get("agent_name") or _agent_for_host(host)
 
         resp_json = None
         try:
@@ -338,7 +379,7 @@ class AgentTrafficAddon:
                     "tool.result",
                     f"{span_id}_tool_result",
                     f"{span_id}_tool",
-                    actor={"type": "agent", "name": "Kiro"},
+                    actor={"type": "agent", "name": agent_name},
                     action={
                         "name": tool["tool_name"],
                         "arguments_redacted": {"status_code": flow.response.status_code},
@@ -353,7 +394,7 @@ class AgentTrafficAddon:
                     "llm.response",
                     f"{span_id}_llm_result",
                     f"{span_id}_llm",
-                    actor={"type": "agent", "name": "Kiro"},
+                    actor={"type": "agent", "name": agent_name},
                     action={
                         "name": "chat_completion",
                         "arguments_redacted": {"status_code": flow.response.status_code},
@@ -369,12 +410,12 @@ class AgentTrafficAddon:
                             "conversation.assistant",
                             f"{span_id}_conv_assistant",
                             f"{span_id}_llm",
-                            actor={"type": "agent", "name": "Kiro"},
+                            actor={"type": "agent", "name": agent_name},
                             action={
                                 "name": "assistant_message",
                                 "arguments_redacted": {"role": m["role"], "preview": m["content"][:200]},
                                 "result_summary": {},
-                                "summary": f"Kiro → User: {m['content'][:120]}",
+                                "summary": f"{agent_name} → User: {m['content'][:120]}",
                             },
                         )
                         _post(conv_ev)
@@ -384,7 +425,7 @@ class AgentTrafficAddon:
             "tool.http",
             f"{span_id}_resp",
             span_id,
-            actor={"type": "agent", "name": "Kiro"},
+            actor={"type": "agent", "name": agent_name},
             action={
                 "name": "http_response",
                 "arguments_redacted": {
