@@ -39,6 +39,7 @@ STATE = {
     "alerts": [],           # 最近 200 条实时告警
     "counters": {},         # 按 event_type 计数
     "last": None,           # 最新事件时间
+    "fs_seen": {},          # 跨观察器 fs 去重缓存: (event_type,path,size) -> (trace_id, wall_time)
 }
 LOCK = threading.Lock()
 CONTROL_TOKEN = secrets.token_urlsafe(24)
@@ -389,6 +390,32 @@ def ingest_event(ev: dict, config: dict):
     et = ev.get("event_type", "unknown")
     trace_id = ev.get("trace_id") or config["fallback_trace_id"]
     ev.setdefault("trace_id", trace_id)
+
+    # —— 跨观察器 fs 去重 ——
+    # 同一工作区常被多个 Agent 观察器同时监视（如 tracker 根目录本身），
+    # FSEvents 不携带写入进程 pid，导致同一次文件变更被每个观察器各上报一条、
+    # 且都只有 actor=workspace —— 出现"VS Code 写的文件记到 WorkBuddy 头上"。
+    # 规则：fs.* 且 actor.type=workspace 的事件，若 10 秒内已有其他 trace 上报
+    # 相同 event_type+path+size，则丢弃后到者，保留首个观察器的记录。
+    if et.startswith("fs.") and (ev.get("actor") or {}).get("type") == "workspace":
+        _act = ev.get("action") or {}
+        _path = ((_act.get("arguments_redacted") or {}).get("path")) or ""
+        _size = str(((_act.get("result_summary") or {}).get("size")) or "")
+        if _path:
+            _key = (et, str(_path), _size)
+            _now = time.time()
+            with LOCK:
+                _prev = STATE["fs_seen"].get(_key)
+                if _prev and _prev[0] != trace_id and (_now - _prev[1]) <= 10.0:
+                    print(f"[collector] fs 去重: 丢弃 {trace_id} 的重复 {et} {_path}"
+                          f"（已由 {_prev[0]} 记录）", flush=True)
+                    return
+                STATE["fs_seen"][_key] = (trace_id, _now)
+                if len(STATE["fs_seen"]) > 5000:  # 防膨胀：清掉 60 秒前的条目
+                    STATE["fs_seen"] = {
+                        k: v for k, v in STATE["fs_seen"].items()
+                        if _now - v[1] <= 60.0
+                    }
 
     # 维护哈希链（简单模式：按文件内顺序，每条事件只依赖前一条 hash）
     chain_file = Path(config["events_dir"]) / f"{trace_id}.ndjson"
