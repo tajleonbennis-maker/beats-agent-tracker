@@ -1,0 +1,53 @@
+# Packetbeat —— 流量维度采集（系统事实链·网络内容层）
+#
+# 职责边界（与 filebeat.yml 一致）：只负责采集/解析/传输，不做关联。
+# 关联由 correlator/enrich.py 完成：Packetbeat 在内核/驱动层抓包，
+# 看不到子进程环境变量里的 AGENT_TRACE_ID，所以流量事件天生没有 trace_id，
+# 需要按「四元组 + 时间窗」join 回 net.connect 事件。
+#
+# ⚠️ 运行权限：实时抓包需要 root（macOS: sudo；Linux: root 或 CAP_NET_RAW）。
+# ⚠️ macOS 上 device 不支持 any，需指定具体网卡：
+#    - 本机回环（demo collector 在 127.0.0.1）→ device: lo0
+#    - 物理出网 → device: en0
+# Linux 可用 device: any（若底层 af_packet 不可用则回退 pcap）。
+
+packetbeat.interfaces:
+  - type: pcap
+    device: lo0            # macOS 回环；Linux 改为 any
+    snaplen: 1514
+
+# 非协议流量的四元组级记录（字节数/包数/方向）——抓不到 payload 时至少有流量事实
+packetbeat.flows:
+  timeout: 10s
+  period: 5s
+
+# 协议解析：只解明文协议；TLS 流量只有 flow 事实（无法也不应解密）
+packetbeat.protocols:
+  dns:
+    ports: [53]
+    include_authorities: true
+    include_additionals: true
+  http:
+    ports: [80, 8000, 8080, 9999]   # 9999 = demo collector
+    send_request: true              # 请求头+body 进事件（进入 Filebeat/ES 后统一脱敏）
+    send_response: true
+    split_request_by_cookie: false
+
+# 只保留 ECS 关键字段，输出保持与 filebeat 同构，方便一个 pipeline 处理
+processors:
+  - add_host_metadata: ~
+  - add_cloud_metadata: ~
+  - add_fields:
+      target: ""
+      fields:
+        agent_trace.collector: packetbeat
+  - drop_fields:
+      fields:
+        - packetbeat.interfaces
+
+output.console:
+  pretty: false
+
+# 关闭索引管理（console 输出不需要）
+setup.template.enabled: false
+setup.ilm.enabled: false
