@@ -1,0 +1,49 @@
+{
+  "description": "Agent 执行跟踪 ingest pipeline：ECS 兜底映射 + 事件归类",
+  "processors": [
+    {
+      "date": {
+        "field": "timestamp",
+        "formats": ["RFC3339"],
+        "target_field": "@timestamp",
+        "ignore_failure": true
+      }
+    },
+    { "set": { "field": "event.kind", "value": "event" } },
+    {
+      "set": {
+        "field": "event.category",
+        "value": "process",
+        "if": "ctx?.event_type == 'process.exec'"
+      }
+    },
+    {
+      "set": {
+        "field": "event.category",
+        "value": "file",
+        "if": "['fs.read','fs.write','fs.snapshot'].contains(ctx?.event_type)"
+      }
+    },
+    {
+      "set": {
+        "field": "event.category",
+        "value": "network",
+        "if": "ctx?.event_type == 'net.connect'"
+      }
+    },
+    {
+      "set": {
+        "field": "event.category",
+        "value": "agent",
+        "if": "['model.turn','tool.call','tool.result','approval','user_request','final_response','trace.begin'].contains(ctx?.event_type)"
+      }
+    },
+    {
+      "set": {
+        "field": "labels.risk_flag",
+        "value": "true",
+        "if": "ctx?.event_type == 'net.connect' && ctx?.action?.arguments_redacted?.peer != null"
+      }
+    }
+  ]
+}
