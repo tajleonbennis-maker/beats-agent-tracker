@@ -659,8 +659,11 @@ def create_app(events_dir: str, fallback_trace_id: str):
                     "trace_id": tid, "first": ev.get("timestamp"),
                     "last": ev.get("timestamp"), "events": 0,
                     "agent": None, "source": ev.get("source"), "active": False,
+                    "conv": 0,
                 })
                 item["events"] += 1
+                if str(ev.get("event_type", "")).startswith("conversation"):
+                    item["conv"] += 1
                 item["last"] = ev.get("timestamp") or item["last"]
                 actor = ev.get("actor") or {}
                 observed_agent = actor.get("agent") or actor.get("name")
@@ -1202,7 +1205,6 @@ function alertEntry(a){
 // —— 任务卡（一条指令 = 一张卡，含完整事件时间线） ——
 // 时间线数据全局注册表：只存原始事件引用，行 HTML 展开时才分批构建（防内嵌 webview 内存闪退）
 let TL_ITEMS = [];      // 每张任务卡的时间线条目数组（{ms, ev} 或 {ms, alert, noise}）
-let TL_OPEN = new Set(); // 轮询重渲染后需恢复展开状态的任务卡 data-tl 索引
 const TL_CHUNK = 300;    // 每批渲染行数
 // Web 搜索足迹跨任务去重：query/url 只归属首次出现的任务卡。
 // 原因：LLM 每次请求都携带完整会话历史，之前搜索的结果 URL 会在后续每个任务时段的
@@ -1255,8 +1257,12 @@ function renderTasks(events, alerts){
     box.innerHTML = '<div class="empty">暂无记录 — 等待事件流入…</div>';
     return;
   }
-  // 记住当前展开的卡，重渲染后恢复
-  document.querySelectorAll('.tlbox').forEach(b => { if(b.open) TL_OPEN.add(b.dataset.tl); });
+  // 快照当前 UI（展开/过滤/滚动），重渲染后原样恢复——周期刷新不再打断阅读
+  const snap = { y: window.scrollY, boxes: [] };
+  document.querySelectorAll('.tlbox').forEach(b => {
+    const tlEl = b.querySelector('.tl');
+    snap.boxes.push({ open: b.open, f: (tlEl && tlEl.dataset.f) || 'all', top: (tlEl && tlEl.scrollTop) || 0 });
+  });
   const tasks = [];
   const firstT = instructions.length ? (normTs(instructions[0].timestamp)||Infinity) : Infinity;
   if(instructions.length){
@@ -1281,8 +1287,8 @@ function renderTasks(events, alerts){
   TL_ITEMS = [];       // taskCard 内会重新填充
   SEARCH_SEEN = { q: new Set(), u: new Set() };  // 搜索足迹去重也随重渲染重置
   box.innerHTML = tasks.map(taskCard).join('');
-  // 绑定过滤按钮 + 懒渲染 toggle + 恢复展开状态
-  document.querySelectorAll('.tlbox').forEach(box2 => {
+  // 绑定过滤按钮 + 懒渲染 toggle + 恢复展开/过滤/滚动状态
+  document.querySelectorAll('.tlbox').forEach((box2,i) => {
     box2.querySelectorAll('.fbtn').forEach(btn => {
       btn.addEventListener('click', () => {
         box2.querySelectorAll('.fbtn').forEach(b=>b.classList.remove('on'));
@@ -1296,13 +1302,28 @@ function renderTasks(events, alerts){
         renderTlBox(box2);
       }
     });
-    if(TL_OPEN.has(box2.dataset.tl)){
+    const st = snap.boxes[i];
+    if(st && st.open){
       box2.open = true;
       box2.dataset.rendered = '1';
       renderTlBox(box2);
+      const tlEl = box2.querySelector('.tl');
+      if(tlEl){
+        // 恢复滚动位置需要先渲染足够多的批次
+        const items2 = TL_ITEMS[+box2.dataset.tl] || [];
+        let guard = 0;
+        while(tlEl.scrollHeight < st.top + tlEl.clientHeight + 300 && tlEl.__rendered < items2.length && guard++ < 60){
+          appendTlBatch(box2, items2);
+        }
+        tlEl.dataset.f = st.f;
+        tlEl.scrollTop = st.top;
+        box2.querySelectorAll('.fbtn').forEach(x=>x.classList.remove('on'));
+        const onBtn = box2.querySelector('.fbtn[data-f="' + st.f + '"]');
+        if(onBtn) onBtn.classList.add('on');
+      }
     }
   });
-  TL_OPEN.clear();
+  window.scrollTo(0, snap.y);
 }
 
 function taskCard(task){
@@ -1429,6 +1450,13 @@ document.getElementById('noiseToggle').addEventListener('change', function(){
 // 避免每 10 秒重复解析 ~15MB JSON 造成 webview 内存压力（闪退根因之一）
 let ALERTS = [];
 let LAST_SIG = null;
+let LAST_DATA_SIG = null;   // 当前视图真实数据签名，未变化则跳过重渲染（防闪烁）
+// 默认视图 v2：v1 首次进入会自动选中"最活跃 Agent"（几乎总是 WorkBuddy 本机自身流量，
+// 因为查案面板本身就在被 WorkBuddy 会话使用）——用户预期是看全部。v2 起默认"全部 Agent"。
+if(!localStorage.getItem('boss.trace.v2')){
+  localStorage.removeItem('boss.trace');
+  localStorage.setItem('boss.trace.v2','1');
+}
 let ACTIVE_TRACE = localStorage.getItem('boss.trace') || '';
 let TRACE_READY = false;
 let TRACE_GROUPS = new Map();
@@ -1445,15 +1473,20 @@ async function loadTraces(){
     if(id.includes('kiro') || name === 'kiro') return 'Kiro';
     return '其他 / 历史';
   };
+  // 选择器只显示近 6 小时内活跃的 trace；ebpf/mem/srv 等历史测试数据不再混进来
+  const now = Date.now();
+  const fresh = traces.filter(t => t.active || !t.last || (now - (normTs(t.last)||0)) < 6*3600*1000);
   const groups = new Map();
-  traces.forEach(t => { const g=agentOf(t); if(!groups.has(g)) groups.set(g,[]); groups.get(g).push(t); });
+  fresh.forEach(t => { const g=agentOf(t); if(!groups.has(g)) groups.set(g,[]); groups.get(g).push(t); });
   TRACE_GROUPS = groups;
   const order = ['Codex · VS Code','WorkBuddy','Trae','Kiro','其他 / 历史'];
   const options = '<option value="">全部 Agent（可能混合会话）</option>' + order.filter(g=>groups.has(g)).map(g =>
     '<optgroup label="' + esc(g) + '">' +
     (g === '其他 / 历史' ? '' : '<option value="agent:' + esc(g) + '">● ' + esc(g) + ' · 全部事件</option>') +
     groups.get(g).map(t => {
-      const label = t.trace_id.includes('_main') ? '主会话' : (t.trace_id.includes('_https') ? 'HTTPS 流' : '进程 / 审计');
+      // 会话类 trace（含 conversation.* 事件）标注为"会话/上下文"，不再一律误标"进程 / 审计"
+      const label = t.trace_id.includes('_https') ? 'HTTPS 流'
+        : ((t.conv||0) > 0 ? '会话/上下文' : (t.trace_id.includes('_main') ? '主会话' : '进程 / 审计'));
       return '<option value="' + esc(t.trace_id) + '">' + (t.active?'● ':'') + label + ' · ' + esc(t.trace_id.slice(-12)) + ' · ' + t.events + '事件</option>';
     }).join('') + '</optgroup>'
   ).join('');
@@ -1482,11 +1515,11 @@ async function loadTraces(){
     picker.insertAdjacentHTML('beforeend', '<option value="' + esc(selected) + '">当前会话 · 等待事件</option>');
     picker.value = selected;
   }
-  else if(!TRACE_READY && traces.length){
-    const group = agentOf(traces[0]);
-    ACTIVE_TRACE = group === '其他 / 历史' ? traces[0].trace_id : 'agent:' + group;
-    picker.value = ACTIVE_TRACE;
-    localStorage.setItem('boss.trace', ACTIVE_TRACE);
+  else if(!TRACE_READY){
+    // 首次进入默认"全部 Agent"，不再自动跳到最活跃 Agent（那几乎总是 WorkBuddy 自身）
+    ACTIVE_TRACE = '';
+    picker.value = '';
+    TRACE_READY = true;
   }
   TRACE_READY = true;
 }
@@ -1495,6 +1528,7 @@ document.getElementById('tracePicker').addEventListener('change', e => {
   ACTIVE_TRACE = e.target.value;
   localStorage.setItem('boss.trace', ACTIVE_TRACE);
   LAST_SIG = null;
+  LAST_DATA_SIG = null;
   load();
 });
 
@@ -1529,6 +1563,12 @@ async function load(){
   let events = eventParts.flat().filter(Boolean);
   events = dedupeFs(events);
   events.sort((a,b) => (normTs(a.timestamp)||0) - (normTs(b.timestamp)||0));
+  // 防闪烁关键：/api/state 的 total/alerts 是全局的，任何一个 Agent 来新事件都会变；
+  // 但用户看的是当前选中的视图——当前视图数据没变就不重渲染（整页重建会重置滚动/展开状态）
+  const dataSig = ACTIVE_TRACE + '|' + events.length + '|' +
+    (events.length ? (normTs(events[events.length-1].timestamp)||0) : '') + '|' + ALERTS.length;
+  if(dataSig === LAST_DATA_SIG) return;
+  LAST_DATA_SIG = dataSig;
   renderMeta(events, ALERTS);
   renderStats(events, ALERTS);
   renderRisk(ALERTS);
@@ -1555,7 +1595,7 @@ liveEvents.onmessage = ev => {
       } else if(tid !== ACTIVE_TRACE) return;
     }
     clearTimeout(liveTimer);
-    liveTimer = setTimeout(()=>{ LAST_SIG=null; load(); }, 700);
+    liveTimer = setTimeout(()=>{ LAST_SIG=null; LAST_DATA_SIG=null; load(); }, 1200);
   } catch(_) {}
 };
 </script>
